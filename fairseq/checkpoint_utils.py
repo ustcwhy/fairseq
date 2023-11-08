@@ -282,7 +282,7 @@ def load_checkpoint(cfg: CheckpointConfig, trainer, **passthrough_args):
     return extra_state, epoch_itr
 
 
-def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False, is_moe=False):
+def load_checkpoint_to_cpu(path, =None, load_on_all_ranks=False, is_moe=False):
     """Loads a checkpoint to CPU (with upgrading for backward compatibility).
 
     If doing single-GPU training or if the checkpoint is only being loaded by at
@@ -337,10 +337,11 @@ def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False, is
 
         old_primitive = _utils.is_primitive_type
         _utils.is_primitive_type = lambda _: True
-        
-        for key, value in arg_overrides.items():
-            if key not in state["cfg"]["model"]:
-                state["cfg"]["model"][key] = value
+
+        if arg_overrides is not None:
+            for key, value in arg_overrides.items():
+                if key not in state["cfg"]["model"]:
+                    state["cfg"]["model"][key] = value
 
         state["cfg"] = OmegaConf.create(state["cfg"])
 

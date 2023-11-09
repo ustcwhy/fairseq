@@ -202,6 +202,7 @@ class MoECriterion(FairseqCriterion):
             gate_loss = - torch.log(gate_loss)
         gate_loss = sample_size * gate_loss
         loss = inner_loss + self.gate_loss_weight * gate_loss
+        print(f"loss is {loss}, gate loss is {gate_loss}")
         return loss, inner_loss, gate_loss, self.get_moe_metadata(model), sample_size, logging_output
 
     def compute_inner_loss(self, model, sample):

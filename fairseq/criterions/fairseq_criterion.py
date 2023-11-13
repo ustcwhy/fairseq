@@ -167,6 +167,7 @@ class MoECriterion(FairseqCriterion):
         "moe_second_expert_threshold",
         "expert1_token",
         "expert2_token",
+        "moe_expert_noise_threshold",
     ]
     def __init__(self, task, moe_gate_loss_wt, moe_gate_loss_combine_method, moe_gate_loss_transform, sentence_avg):
         super().__init__(task)

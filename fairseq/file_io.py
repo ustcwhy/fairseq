@@ -209,7 +209,8 @@ def torch_load_cpu(path):
     # If model was trained with fp16, model from loaded state_dict can be moved to fp16
     if isinstance(state, dict) and 'cfg' in state:
         if state['cfg']['common']['fp16'] or state['cfg']['common']['memory_efficient_fp16']:
-            state['model'] = {k: v.half() for k, v in state['model'].items()}
+            # state['model'] = {k: v.half() for k, v in state['model'].items()}
+            state['model'] = {k: v.half() if isinstance(v, torch.Tensor) else v for k, v in state['model'].items()}
     return state
 
 

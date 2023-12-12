@@ -931,6 +931,10 @@ class CommonEvalConfig(FairseqDataclass):
 
 @dataclass
 class EvalLMConfig(FairseqDataclass):
+    is_quips: bool = field(
+        default=False,
+        metadata={"help": ""},
+    )
     input_quant_method: str = field(
         default="",
         metadata={"help": ""},

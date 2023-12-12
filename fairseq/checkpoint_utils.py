@@ -282,7 +282,7 @@ def load_checkpoint(cfg: CheckpointConfig, trainer, **passthrough_args):
     return extra_state, epoch_itr
 
 
-def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False, is_moe=False):
+def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False, is_moe=False, is_quips=False):
     """Loads a checkpoint to CPU (with upgrading for backward compatibility).
 
     If doing single-GPU training or if the checkpoint is only being loaded by at
@@ -321,6 +321,9 @@ def load_checkpoint_to_cpu(path, arg_overrides=None, load_on_all_ranks=False, is
         expert_state = moe_checkpoint_utils.load_expert_state(local_path)  # Possibly merge experts
         shared_state = torch_load_cpu(shared_path)
         state = moe_checkpoint_utils.merge_expert_and_shared_state(expert_state, shared_state)
+    elif is_quips:
+        # quips use int16 for codebook, thus directly load checkpoint, avoid converting model into fp16
+        state = torch.load(local_path, map_location=torch.device("cpu"))
     else:
         state = torch_load_cpu(local_path)
 
@@ -442,6 +445,7 @@ def load_model_ensemble_and_task(
     num_shards=1,
     state=None,
     is_moe=False,
+    is_quips=False,
 ):
     logger.info("load_model_ensemble_and_task is_moe={}".format(is_moe))
     assert state is None or len(filenames) == 1
@@ -466,7 +470,7 @@ def load_model_ensemble_and_task(
             if not PathManager.exists(filename):
                 raise IOError("Model file not found: {}".format(filename))
             if state is None:
-                state = load_checkpoint_to_cpu(filename, arg_overrides, is_moe=is_moe)
+                state = load_checkpoint_to_cpu(filename, arg_overrides, is_moe=is_moe, is_quips=is_quips)
             if "args" in state and state["args"] is not None:
                 cfg = convert_namespace_to_omegaconf(state["args"])
             elif "cfg" in state and state["cfg"] is not None:

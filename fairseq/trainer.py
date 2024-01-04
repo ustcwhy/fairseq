@@ -491,6 +491,7 @@ class Trainer(object):
         reset_lr_scheduler=False,
         optimizer_overrides=None,
         reset_meters=False,
+        reset_dataloader=False,
     ):
         """
         Load all training state from a checkpoint file.

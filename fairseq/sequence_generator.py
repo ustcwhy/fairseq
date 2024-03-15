@@ -366,7 +366,9 @@ class SequenceGenerator(nn.Module):
                         img_features=first_img_features,
                         img_gpt_input_mask=first_gpt_input_mask,
                         incremental_state=incremental_states[0],
-                        first_step=True)
+                        first_step=True,
+                        split_positions=self.model.models[0].args.latent_query_num + 1,
+                    )
                     attn: Optional[Tensor] = None
                     decoder_out_tuple = decoder_out[0].div_(self.temperature)
                     decoder_out_tuple = (decoder_out_tuple, None)
@@ -388,7 +390,8 @@ class SequenceGenerator(nn.Module):
                         aud_features=aud_features,
                         aud_gpt_input_mask=sample['net_input']['aud_gpt_input_mask'].cuda().bool(),
                         incremental_state=incremental_states[0],
-                        first_step=True)
+                        first_step=True,
+                    )
                     attn: Optional[Tensor] = None
                     decoder_out_tuple = decoder_out[0].div_(self.temperature)
                     decoder_out_tuple = (decoder_out_tuple, None)
@@ -411,6 +414,7 @@ class SequenceGenerator(nn.Module):
                         incremental_states,
                         self.temperature,
                         multimodal=multimodal_infer,
+                        split_positions=0,
                     )
 
             if self.lm_model is not None:
@@ -863,6 +867,7 @@ class EnsembleModel(nn.Module):
         incremental_states: List[Dict[str, Dict[str, Optional[Tensor]]]],
         temperature: float = 1.0,
         multimodal: bool = False,
+        split_positions=0,
     ):
         log_probs = []
         avg_attn: Optional[Tensor] = None
@@ -877,6 +882,7 @@ class EnsembleModel(nn.Module):
                         tokens,
                         encoder_out=encoder_out,
                         incremental_state=incremental_states[i],
+                        split_positions=split_positions,
                     )
                 else:
                     decoder_out = model.decoder.forward(
@@ -890,6 +896,7 @@ class EnsembleModel(nn.Module):
                     tokens,
                     encoder_out=encoder_out,
                     incremental_state=incremental_states[i],
+                    split_positions=split_positions,
                 )
             else:
                 if hasattr(model, "decoder"):

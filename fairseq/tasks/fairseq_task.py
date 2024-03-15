@@ -517,10 +517,11 @@ class FairseqTask(object):
         if ignore_grad:
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
-            if isinstance(model, DeepSpeedEngine):
-                model.backward(loss)
-            else:
-                optimizer.backward(loss)
+            # if isinstance(model, DeepSpeedEngine):
+            #     model.backward(loss)
+            # else:
+            #     optimizer.backward(loss)
+            optimizer.backward(loss)
         return loss, sample_size, logging_output
 
     def valid_step(self, sample, model, criterion):

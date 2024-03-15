@@ -22,6 +22,7 @@ from fairseq.dataclass.utils import (
     convert_namespace_to_omegaconf,
     overwrite_args_by_name,
 )
+from fairseq.distributed import utils as dist_utils
 from fairseq.distributed.fully_sharded_data_parallel import FSDP, has_FSDP
 from fairseq.distributed import utils as distributed_utils
 from fairseq.file_io import PathManager
@@ -837,21 +838,21 @@ def load_pretrained_component_from_model(
     return component
 
 
-def verify_checkpoint_directory(save_dir: str, rank: int) -> None:
+def verify_checkpoint_directory(save_dir: str, rank: int = None) -> None:
     if not os.path.exists(save_dir):
         os.makedirs(save_dir, exist_ok=True)
-    if rank is not None:
-        temp_file_path = os.path.join(save_dir, f"dummy-{rank}")
-        try:
-            with open(temp_file_path, "w"):
-                pass
-        except OSError as e:
-            logger.warning(
-                "Unable to access checkpoint save directory: {}".format(save_dir)
-            )
-            raise e
-        else:
-            os.remove(temp_file_path)
+    rank = dist_utils.get_global_rank() if rank is None else rank
+    temp_file_path = os.path.join(save_dir, f"dummy-{rank}")
+    try:
+        with open(temp_file_path, "w"):
+            pass
+    except OSError as e:
+        logger.warning(
+            "Unable to access checkpoint save directory: {}".format(save_dir)
+        )
+        raise e
+    else:
+        os.remove(temp_file_path)
 
 
 def load_ema_from_checkpoint(fpath):

@@ -545,6 +545,8 @@ def get_activation_fn(activation: str) -> Callable:
         return lambda x: x
     elif activation == "silu":
         return F.silu
+    elif activation == "leaky_relu":
+        return F.leaky_relu
     else:
         raise RuntimeError("--activation-fn {} not supported".format(activation))
 
@@ -558,6 +560,7 @@ def get_available_activation_fns() -> List:
         "tanh",
         "linear",
         "silu",
+        "leaky_relu",
     ]
 
 

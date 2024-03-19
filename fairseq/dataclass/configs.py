@@ -238,7 +238,7 @@ class DistributedTrainingConfig(FairseqDataclass):
         default=0,
         metadata={
             "help": "which GPU to use (usually configured automatically)",
-            "argparse_alias": "--local-rank",
+            "argparse_alias": "--local_rank",
         },
     )
     distributed_no_spawn: bool = field(
@@ -931,6 +931,10 @@ class CommonEvalConfig(FairseqDataclass):
 
 @dataclass
 class EvalLMConfig(FairseqDataclass):
+    is_quips: bool = field(
+        default=False,
+        metadata={"help": ""},
+    )
     input_quant_method: str = field(
         default="",
         metadata={"help": ""},

@@ -427,8 +427,7 @@ class _MemoryEfficientFP16OptimizerMixin(object):
             # detect overflow and adjust loss scale
             self.scaler.check_overflow(grad_norm_cpu)
         elif max_norm > 0.0:
-            grad_norm_cpu = float(grad_norm)
-            clip_coef = (max_norm / (grad_norm_cpu + 1e-6)).clamp_(max=1)
+            clip_coef = (max_norm / (grad_norm + 1e-6)).clamp_(max=1)
             self._multiply_factor *= clip_coef
 
         return grad_norm

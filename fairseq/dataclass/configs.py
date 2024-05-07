@@ -134,7 +134,7 @@ class CommonConfig(FairseqDataclass):
     )
     cpu: bool = field(default=False, metadata={"help": "use CPU instead of CUDA"})
     tpu: bool = field(default=False, metadata={"help": "use TPU instead of CUDA"})
-    bf16: bool = field(default=False, metadata={"help": "use bfloat16; implies --tpu"})
+    bf16: bool = field(default=False, metadata={"help": "use bfloat16"})
     memory_efficient_bf16: bool = field(
         default=False,
         metadata={

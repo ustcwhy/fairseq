@@ -199,7 +199,7 @@ def parse_args_and_arch(
     args.tpu = getattr(args, "tpu", False)
     args.bf16 = getattr(args, "bf16", False)
     if args.bf16:
-        args.tpu = True
+        args.tpu = False
     if args.tpu and args.fp16:
         raise ValueError("Cannot combine --fp16 and --tpu, use --bf16 on TPUs")
 

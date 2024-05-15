@@ -130,6 +130,21 @@ def get_incremental_state(
     return module.get_incremental_state(incremental_state, key)
 
 
+def safe_getattr(obj, k, default=None):
+    """Returns obj[k] if it exists and is not None, otherwise returns default."""
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(obj):
+        return obj[k] if k in obj and obj[k] is not None else default
+
+    return getattr(obj, k, default)
+
+
+def safe_hasattr(obj, k):
+    """Returns True if the given key exists and is not None."""
+    return getattr(obj, k, None) is not None
+
+
 def set_incremental_state(
     module, # type: MultiheadAttention,
     incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]],

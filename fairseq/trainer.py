@@ -770,14 +770,14 @@ class Trainer(object):
             if self.is_moe and getattr(self.cfg.dataset, 'batch_size', None) is not None:
                 try:
                     fixed_src_seq_length = getattr(self.cfg.task, 'tokens_per_sample', None) or self.cfg.task.max_source_positions
-                    assert sample['gpt']['net_input']['src_tokens'].shape[1] == fixed_src_seq_length
+                    assert sample['vl_laion']['net_input']['src_tokens'].shape[1] == fixed_src_seq_length
                 except:
-                    logger.warning(str(sample['gpt'].keys()))
-                    logger.warning(str(sample['gpt']['net_input'].keys()))
+                    logger.warning(str(sample['vl_laion'].keys()))
+                    logger.warning(str(sample['vl_laion']['net_input'].keys()))
                     logger.warning(is_dummy_batch)
                     logger.warning(
                         "wrong seq len {} on rank {}".format(
-                                sample['gpt']['net_input']['src_tokens'].shape[1],
+                                sample['vl_laion']['net_input']['src_tokens'].shape[1],
                                 torch.distributed.get_rank(),
                         )
                     )

@@ -251,6 +251,9 @@ class CommonConfig(FairseqDataclass):
         default=0,
         metadata={"help": "exit after this many seconds"},
     )
+    log_nvidia_smi: bool = field(
+        default=False, metadata={"help": "log output from nvidia-smi during training"}
+    )
 
 
 @dataclass
@@ -782,6 +785,16 @@ class CheckpointConfig(FairseqDataclass):
                 "thread. NOTE: This feature is currently being tested."
             ),
             "argparse_alias": "--save-async",
+        },
+    )
+    s3_upload_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Upload checkpoints asynchronously in a separate "
+                "thread to S3. NOTE: This feature is currently being tested."
+            ),
+            "argparse_alias": "--s3-dir",
         },
     )
     model_parallel_size: int = II("common.model_parallel_size")

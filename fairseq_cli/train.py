@@ -12,9 +12,31 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Any, List, Tuple, Callable
 
-# We need to setup root logger before importing any fairseq libraries.
+import numpy as np
+import torch
+import torch.distributed as dist
+import functools
+from fairseq import (
+    checkpoint_utils,
+    options,
+    quantization_utils,
+    tasks,
+    utils,
+)
+from fairseq.data import iterators, data_utils
+from fairseq.data.plasma_utils import PlasmaStore
+from fairseq.dataclass.configs import FairseqConfig
+from fairseq.dataclass.utils import convert_namespace_to_omegaconf
+from fairseq.distributed import fsdp_enable_wrap, fsdp_wrap, utils as distributed_utils
+from fairseq.file_io import PathManager
+from fairseq.logging import meters, metrics, progress_bar
+from fairseq.model_parallel.megatron_trainer import MegatronTrainer
+from fairseq.trainer import Trainer
+from omegaconf import DictConfig, OmegaConf
+
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -23,23 +45,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fairseq_cli.train")
 
-import numpy as np
-import torch
-from omegaconf import DictConfig, OmegaConf
-
-from fairseq import checkpoint_utils, options, quantization_utils, tasks, utils
-from fairseq.data import data_utils, iterators
-from fairseq.data.plasma_utils import PlasmaStore
-from fairseq.dataclass.configs import FairseqConfig
-from fairseq.dataclass.utils import convert_namespace_to_omegaconf
-from fairseq.distributed import fsdp_enable_wrap, fsdp_wrap
-from fairseq.distributed import utils as distributed_utils
-from fairseq.file_io import PathManager
-from fairseq.logging import meters, metrics, progress_bar
-from fairseq.model_parallel.megatron_trainer import MegatronTrainer
-from fairseq.trainer import Trainer
-from multiprocessing.pool import ThreadPool
-
 
 def main(cfg: FairseqConfig) -> None:
     if isinstance(cfg, argparse.Namespace):
@@ -47,10 +52,7 @@ def main(cfg: FairseqConfig) -> None:
 
     utils.import_user_module(cfg.common)
 
-    if (
-        distributed_utils.is_master(cfg.distributed_training)
-        and "job_logging_cfg" in cfg
-    ):
+    if distributed_utils.is_master(cfg.distributed_training) and "job_logging_cfg" in cfg:
         # make hydra logging work with ddp (see # see https://github.com/facebookresearch/hydra/issues/1126)
         logging.config.dictConfig(OmegaConf.to_container(cfg.job_logging_cfg))
 
@@ -66,22 +68,10 @@ def main(cfg: FairseqConfig) -> None:
     np.random.seed(cfg.common.seed)
     utils.set_torch_seed(cfg.common.seed)
 
-    ds_local_master = cfg.common.deepspeed and distributed_utils.is_local_master(cfg.distributed_training)
+    checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
 
-    if distributed_utils.is_master(cfg.distributed_training) or ds_local_master:
-        checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir, rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else None)
-        ckp_copy_thread = ThreadPool(processes=1)
-    else:
-        ckp_copy_thread = None
-    # if distributed_utils.is_master(cfg.distributed_training) or ds_local_master:
-    #     print(distributed_utils.is_master(cfg.distributed_training), ds_local_master)
-    #     checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
-    #     ckp_copy_thread = ThreadPool(processes=1)
-    # else:
-    #     ckp_copy_thread = None
-    # if distributed_utils.is_master(cfg.distributed_training):
-    #     print(cfg.distributed_training)
-    #     checkpoint_utils.verify_checkpoint_directory(cfg.checkpoint.save_dir)
+    # Print nvidia smi stats
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Print args
     logger.info(cfg)
@@ -100,41 +90,43 @@ def main(cfg: FairseqConfig) -> None:
     task = tasks.setup_task(cfg.task)
 
     assert cfg.criterion, "Please specify criterion to train a model"
+    if getattr(cfg.model, "moe_freq", 0) > 0 and getattr(cfg.model, "moe_expert_count", 0) < distributed_utils.get_global_world_size():
+        assert cfg.distributed_training.ddp_backend == 'fully_sharded', 'num_experts < num_gpus only supported by FSDP'
 
     # Build model and criterion
     if cfg.distributed_training.ddp_backend == "fully_sharded":
-        with fsdp_enable_wrap(cfg.distributed_training):
+        #if cfg.distributed_training.use_sharded_state: assert cfg.checkpoint.no_save_optimizer_state, f'--use-sharded-state requires --no-save-optimizer-state'
+        extra = {
+            "is_moe": getattr(cfg.model, "moe_freq", 0) > 0,
+            "use_sharded_state": cfg.distributed_training.use_sharded_state,
+        }
+
+        with fsdp_enable_wrap(cfg.distributed_training, **extra):
             model = fsdp_wrap(task.build_model(cfg.model))
     else:
         model = task.build_model(cfg.model)
     criterion = task.build_criterion(cfg.criterion)
+
+    def is_expert_param(p):
+        return getattr(p, "expert", False) or getattr(p, "base_expert", False)
+
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
     logger.info("model: {}".format(model.__class__.__name__))
     logger.info("criterion: {}".format(criterion.__class__.__name__))
     logger.info(
-        "num. shared model params: {:,} (num. trained: {:,})".format(
-            sum(
-                p.numel() for p in model.parameters() if not getattr(p, "expert", False)
-            ),
-            sum(
-                p.numel()
-                for p in model.parameters()
-                if not getattr(p, "expert", False) and p.requires_grad
-            ),
+        "num. non-expert model params: {:,} (num. trained: {:,})".format(
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if not is_expert_param(p)),
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if not is_expert_param(p) and p.requires_grad),
         )
     )
-
     logger.info(
-        "num. expert model params: {} (num. trained: {})".format(
-            sum(p.numel() for p in model.parameters() if getattr(p, "expert", False)),
-            sum(
-                p.numel()
-                for p in model.parameters()
-                if getattr(p, "expert", False) and p.requires_grad
-            ),
+        "num. expert model params: {:,} (num. trained: {:,})".format(
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if is_expert_param(p)),
+            sum(getattr(p, "_orig_size", p).numel() for p in model.parameters() if is_expert_param(p) and p.requires_grad),
         )
     )
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Load valid dataset (we load training data below, based on the latest checkpoint)
     # We load the valid dataset AFTER building the model
@@ -156,11 +148,7 @@ def main(cfg: FairseqConfig) -> None:
         quantizer = None
 
     # Build trainer
-    if cfg.common.deepspeed:
-        assert quantizer is None, "fairseq wuantizer is not currently supported on deepspeed"
-        from fairseq.ds_trainer import DeepSpeedTrainer
-        trainer = DeepSpeedTrainer(cfg, task, model, criterion)
-    elif cfg.common.model_parallel_size == 1:
+    if cfg.common.model_parallel_size == 1:
         trainer = Trainer(cfg, task, model, criterion, quantizer)
     else:
         trainer = MegatronTrainer(cfg, task, model, criterion)
@@ -170,11 +158,12 @@ def main(cfg: FairseqConfig) -> None:
         )
     )
     logger.info(
-        "max tokens per device = {} and max sentences per device = {}".format(
+        "max tokens per GPU = {} and batch size per GPU = {}".format(
             cfg.dataset.max_tokens,
             cfg.dataset.batch_size,
         )
     )
+    logger.info(metrics.get_nvidia_smi_gpu_memory_stats_str())
 
     # Load the latest checkpoint if one is available and restore the
     # corresponding train iterator
@@ -184,14 +173,9 @@ def main(cfg: FairseqConfig) -> None:
         # don't cache epoch iterators for sharded datasets
         disable_iterator_cache=task.has_sharded_data("train"),
     )
-    if cfg.common.tpu:
-        import torch_xla.core.xla_model as xm
-
-        xm.rendezvous("load_checkpoint")  # wait for all workers
 
     max_epoch = cfg.optimization.max_epoch or math.inf
     lr = trainer.get_lr()
-
     train_meter = meters.StopwatchMeter()
     train_meter.start()
     while epoch_itr.next_epoch_idx <= max_epoch:
@@ -220,6 +204,9 @@ def main(cfg: FairseqConfig) -> None:
         )
     train_meter.stop()
     logger.info("done training in {:.1f} seconds".format(train_meter.sum))
+
+    if getattr(epoch_itr, "should_close_after_finished", False):
+        epoch_itr.close()
 
     # ioPath implementation to wait for all asynchronous file writes to complete.
     if cfg.checkpoint.write_checkpoints_asynchronously:
@@ -274,11 +261,7 @@ def train(
         if epoch_itr.epoch <= len(cfg.optimization.update_freq)
         else cfg.optimization.update_freq[-1]
     )
-    itr = iterators.GroupedIterator(
-        itr,
-        update_freq,
-        skip_remainder_batch=cfg.optimization.skip_remainder_batch,
-    )
+    itr = iterators.GroupedIterator(itr, update_freq)
     if cfg.common.tpu:
         itr = utils.tpu_data_loader(itr)
     progress = progress_bar.progress_bar(
@@ -310,8 +293,10 @@ def train(
     progress.update_config(_flatten_config(cfg))
 
     trainer.begin_epoch(epoch_itr.epoch)
-
-    valid_subsets = cfg.dataset.valid_subset.split(",")
+    if cfg.task._name in ["multilingual_language_modeling", "translation_multi_simple_epoch"]:
+        valid_subsets = task.args.valid_subset.split(",")
+    else:
+        valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
@@ -407,21 +392,15 @@ def validate_and_save(
         )
     )
     do_validate = (
-        (
-            (not end_of_epoch and do_save)  # validate during mid-epoch saves
-            or (end_of_epoch and epoch_itr.epoch % cfg.dataset.validate_interval == 0)
-            or should_stop
-            or (
-                cfg.dataset.validate_interval_updates > 0
-                and num_updates > 0
-                and num_updates % cfg.dataset.validate_interval_updates == 0
-            )
+        (not end_of_epoch and do_save)  # validate during mid-epoch saves
+        or (end_of_epoch and epoch_itr.epoch % cfg.dataset.validate_interval == 0)
+        or should_stop
+        or (
+            cfg.dataset.validate_interval_updates > 0
+            and num_updates > 0
+            and num_updates % cfg.dataset.validate_interval_updates == 0
         )
-        and not cfg.dataset.disable_validation
-        and num_updates >= cfg.dataset.validate_after_updates
-    )
-
-    # Validate
+    ) and not cfg.dataset.disable_validation
     valid_losses = [None]
     if do_validate:
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
@@ -431,11 +410,25 @@ def validate_and_save(
     # Save checkpoint
     if do_save or should_stop:
         checkpoint_utils.save_checkpoint(
-            cfg.checkpoint, trainer, epoch_itr, valid_losses[0]
+            cfg.checkpoint, trainer, epoch_itr, valid_losses[0], training_finished=should_stop,
+            async_callback_fn=functools.partial(post_checkpoint_callback, cfg) if cfg.checkpoint.s3_upload_path else None,
         )
 
+    trainer.reset_dummy_batch(epoch_itr.first_batch)
     return valid_losses, should_stop
 
+def post_checkpoint_callback(cfg, filename):
+    if cfg.checkpoint.s3_upload_path is not None:
+        try:
+            # PathManager only supports writing to S3, but this function call
+            # can be replaced with other APIs for copying checkpoints.
+            PathManager.copy_from_local(
+                filename,
+                os.path.join(cfg.checkpoint.s3_upload_path, os.path.basename(filename)),
+                overwrite=True,
+            )
+        except (FileNotFoundError, AssertionError) as e:
+            logger.info(f'could not upload {filename}: {e}')
 
 def get_training_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
     stats["wall"] = round(metrics.get_meter("default", "wall").elapsed_time, 0)
@@ -458,7 +451,8 @@ def validate(
     trainer.begin_valid_epoch(epoch_itr.epoch)
     valid_losses = []
     for subset in subsets:
-        logger.info('begin validation on "{}" subset'.format(subset))
+        logger.info('begin validation on "{}" subset on rank {}'.format(
+            subset, distributed_utils.get_global_rank()))
 
         # Initialize data iterator
         itr = trainer.get_valid_iterator(subset).next_epoch_itr(
@@ -466,6 +460,13 @@ def validate(
         )
         if cfg.common.tpu:
             itr = utils.tpu_data_loader(itr)
+
+        logger.info('got valid iterator on "{}" subset on rank {}'.format(
+                subset,
+                distributed_utils.get_global_rank()
+            )
+        )
+
         progress = progress_bar.progress_bar(
             itr,
             log_format=cfg.common.log_format,
@@ -488,25 +489,22 @@ def validate(
             ),
         )
 
+        logger.info('Begin looping over validation "{}" subset with length "{}"'.format(subset, len(progress)))
+
         # create a new root metrics aggregator so validation metrics
         # don't pollute other aggregators (e.g., train meters)
         with metrics.aggregate(new_root=True) as agg:
+            logging_outputs = []
             for i, sample in enumerate(progress):
-                if (
-                    cfg.dataset.max_valid_steps is not None
-                    and i > cfg.dataset.max_valid_steps
-                ):
+                if cfg.dataset.max_valid_steps is not None and i > cfg.dataset.max_valid_steps:
                     break
-                trainer.valid_step(sample)
-
+                # trainer.valid_step(sample)
+                inner_logging_outputs = trainer.valid_step(sample)
+                logging_outputs.extend(inner_logging_outputs)
+            task.reduce_metrics(logging_outputs, trainer.get_criterion())
         # log validation stats
         stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values())
-
-        if hasattr(task, "post_validate"):
-            task.post_validate(trainer.get_model(), stats, agg)
-
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
-
         valid_losses.append(stats[cfg.checkpoint.best_checkpoint_metric])
     return valid_losses
 
@@ -535,9 +533,7 @@ def cli_main(
 
     if cfg.common.use_plasma_view:
         server = PlasmaStore(path=cfg.common.plasma_path)
-        logger.info(
-            f"Started plasma server pid {server.server.pid} {cfg.common.plasma_path}"
-        )
+        logger.info(f"Started plasma server pid {server.server.pid} {cfg.common.plasma_path}")
 
     if args.profile:
         with torch.cuda.profiler.profile():

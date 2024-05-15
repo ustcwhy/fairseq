@@ -10,17 +10,17 @@ import importlib
 import logging
 import os
 import sys
+import tempfile
 import warnings
 from itertools import accumulate
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
-import collections
 
-if TYPE_CHECKING:
-    from fairseq.modules.multihead_attention import MultiheadAttention
 
 try:
     from amp_C import multi_tensor_l2norm
@@ -58,9 +58,11 @@ class FileContentsAction(argparse.Action):
         setattr(namespace, self.dest, argument)
 
 
-def split_paths(paths: str, separator=os.pathsep) -> List[str]:
+def split_paths(paths: str) -> List[str]:
     return (
-        paths.split(separator) if "://" not in paths else paths.split(MANIFOLD_PATH_SEP)
+        paths.split(os.pathsep)
+        if "://" not in paths
+        else paths.split(MANIFOLD_PATH_SEP)
     )
 
 
@@ -83,13 +85,6 @@ def apply_to_sample(f, sample):
     def _apply(x):
         if torch.is_tensor(x):
             return f(x)
-        elif isinstance(x, collections.OrderedDict):
-            # OrderedDict has attributes that needs to be preserved
-            od = collections.OrderedDict(
-                (key, _apply(value)) for key, value in x.items()
-            )
-            od.__dict__ = x.__dict__
-            return od
         elif isinstance(x, dict):
             return {key: _apply(value) for key, value in x.items()}
         elif isinstance(x, list):
@@ -115,31 +110,19 @@ def move_to_cuda(sample, device=None):
     return apply_to_sample(_move_to_cuda, sample)
 
 
-def move_to_cpu(sample):
+def move_to_cpu(sample, cast_to_fp32=True):
     def _move_to_cpu(tensor):
         # PyTorch has poor support for half tensors (float16) on CPU.
         # Move any such tensors to float32.
-        if tensor.dtype in {torch.bfloat16, torch.float16}:
+        if cast_to_fp32 and tensor.dtype in {torch.bfloat16, torch.float16}:
             tensor = tensor.to(dtype=torch.float32)
         return tensor.cpu()
 
     return apply_to_sample(_move_to_cpu, sample)
 
 
-def move_to_tpu(sample):
-
-    import torch_xla.core.xla_model as xm
-
-    device = xm.xla_device()
-
-    def _move_to_tpu(tensor):
-        return tensor.to(device)
-
-    return apply_to_sample(_move_to_tpu, sample)
-
-
 def get_incremental_state(
-    module: "MultiheadAttention",
+    module,  # type: MultiheadAttention,
     incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]],
     key: str,
 ) -> Optional[Dict[str, Optional[Tensor]]]:
@@ -148,7 +131,7 @@ def get_incremental_state(
 
 
 def set_incremental_state(
-    module: "MultiheadAttention",
+    module, # type: MultiheadAttention,
     incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]],
     key: str,
     value: Dict[str, Optional[Tensor]],
@@ -266,6 +249,9 @@ def make_positions(tensor, padding_idx: int, onnx_trace: bool = False):
     return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + padding_idx
 
 
+def assert_equal(a, b, msg=''):
+    assert a == b, f"{msg}{a} != {b}"
+
 def strip_pad(tensor, pad):
     return tensor[tensor.ne(pad)]
 
@@ -307,9 +293,6 @@ def convert_padding_direction(
 
 
 def item(tensor):
-    # tpu-comment: making this a no-op for xla devices.
-    if torch.is_tensor(tensor) and tensor.device.type == "xla":
-        return tensor.detach()
     if hasattr(tensor, "item"):
         return tensor.item()
     if hasattr(tensor, "__getitem__"):
@@ -347,24 +330,26 @@ def multi_tensor_total_norm(grads, chunk_size=2048 * 32) -> torch.Tensor:
 def clip_grad_norm_(params, max_norm, aggregate_norm_fn=None) -> torch.Tensor:
     def grad_exists(p):
         return p is not None and getattr(p, "grad", None) is not None
-
     if isinstance(params, torch.Tensor):
         params = [params]
     params = list(params)
-    grads = [
-        p.grad.detach() for p in params if grad_exists(p) and not hasattr(p, "expert")
-    ]
-    expert_grads = [
-        p.grad.detach() for p in params if grad_exists(p) and hasattr(p, "expert")
-    ]
-
+    params = list(filter(grad_exists, params))
+    grads, expert_grads, base_expert_grads, sharded_grads = [], [], [], []
+    for p in params:
+        if hasattr(p, "expert"):
+            expert_grads.append(p.grad.detach())
+        elif hasattr(p, "base_expert"):
+            base_expert_grads.append(p.grad.detach())
+        elif hasattr(p, "_is_sharded"):
+            sharded_grads.append(p.grad.detach())
+        else:
+            grads.append(p.grad.detach())
     if len(grads) == 0:
         if len(params) > 0:
-            return params[0].new_tensor(0.0)
+            total_norm = params[0].new_tensor(0.0)
         else:
-            return torch.tensor(0.0)
-
-    if len(grads) == 1:
+            total_norm = torch.tensor(0.0)
+    elif len(grads) == 1:
         total_norm = torch.norm(grads[0], p=2, dtype=torch.float32)
     else:
         if multi_tensor_l2norm_available:
@@ -386,13 +371,27 @@ def clip_grad_norm_(params, max_norm, aggregate_norm_fn=None) -> torch.Tensor:
                 )
             )
 
+    # calculate split_norm and all_reduce with other workers
+    norms = [total_norm]
+    for split_grads in [expert_grads, sharded_grads]:
+        if len(split_grads) == 0:
+            continue
+        split_norm = torch.norm(torch.stack([torch.norm(g, p=2, dtype=torch.float32) for g in split_grads]))
+        if dist.is_initialized():
+            split_norm.pow_(2)
+            dist.all_reduce(split_norm)
+            split_norm.sqrt_()
+        norms.append(split_norm)
+    if len(norms) > 1:
+        total_norm = torch.norm(torch.stack(norms))
+
     if aggregate_norm_fn is not None:
         total_norm = aggregate_norm_fn(total_norm)
 
     if max_norm > 0:
         max_norm = float(max_norm)
         clip_coef = (max_norm / (total_norm + 1e-6)).clamp_(max=1)
-        for g in grads + expert_grads:
+        for g in grads + expert_grads + sharded_grads + base_expert_grads:
             g.mul_(clip_coef)
     return total_norm
 
@@ -465,9 +464,7 @@ def import_user_module(args):
     module_path = getattr(args, "user_dir", None)
     if module_path is not None:
         module_path = os.path.abspath(args.user_dir)
-        if not os.path.exists(module_path) and not os.path.isfile(
-            os.path.dirname(module_path)
-        ):
+        if not os.path.exists(module_path) and not os.path.isfile(os.path.dirname(module_path)):
             fairseq_rel_path = os.path.join(os.path.dirname(__file__), args.user_dir)
             if os.path.exists(fairseq_rel_path):
                 module_path = fairseq_rel_path
@@ -489,18 +486,6 @@ def import_user_module(args):
             if module_name not in sys.modules:
                 sys.path.insert(0, module_parent)
                 importlib.import_module(module_name)
-
-                tasks_path = os.path.join(module_path, "tasks")
-                if os.path.exists(tasks_path):
-                    from fairseq.tasks import import_tasks
-
-                    import_tasks(tasks_path, f"{module_name}.tasks")
-
-                models_path = os.path.join(module_path, "models")
-                if os.path.exists(models_path):
-                    from fairseq.models import import_models
-
-                    import_models(models_path, f"{module_name}.models")
             else:
                 raise ImportError(
                     "Failed to import --user-dir={} because the corresponding module name "
@@ -539,18 +524,12 @@ def deprecation_warning(message, stacklevel=3):
     warnings.warn(message, stacklevel=stacklevel)
 
 
-def relu_squared(x: torch.Tensor):
-    return F.relu(x).pow(2)
-
-
 def get_activation_fn(activation: str) -> Callable:
-    """Returns the activation function corresponding to `activation`"""
+    """ Returns the activation function corresponding to `activation` """
     from fairseq.modules import gelu, gelu_accurate
 
     if activation == "relu":
         return F.relu
-    elif activation == "relu_squared":
-        return relu_squared
     elif activation == "gelu":
         return gelu
     elif activation == "gelu_fast":
@@ -564,10 +543,10 @@ def get_activation_fn(activation: str) -> Callable:
         return torch.tanh
     elif activation == "linear":
         return lambda x: x
-    elif activation == "swish":
-        return torch.nn.SiLU
     elif activation == "silu":
         return F.silu
+    elif activation == "leaky_relu":
+        return F.leaky_relu
     else:
         raise RuntimeError("--activation-fn {} not supported".format(activation))
 
@@ -581,6 +560,7 @@ def get_available_activation_fns() -> List:
         "tanh",
         "linear",
         "silu",
+        "leaky_relu",
     ]
 
 
@@ -689,13 +669,18 @@ def extract_hard_alignment(attn, src_sent, tgt_sent, pad, eos):
 
 
 def extract_soft_alignment(attn, src_sent, tgt_sent, pad, eos):
-    tgt_valid = ((tgt_sent != pad)).nonzero(as_tuple=False)
-    src_valid = ((src_sent != pad)).nonzero(as_tuple=False).squeeze(dim=-1)
+    tgt_valid = (
+        ((tgt_sent != pad)).nonzero(as_tuple=False)
+    )
+    src_valid = (
+        ((src_sent != pad)).nonzero(as_tuple=False).squeeze(dim=-1)
+    )
     alignment = []
     if len(tgt_valid) != 0 and len(src_valid) != 0:
         attn_valid = attn[tgt_valid, src_valid]
         alignment = [
-            ["{:.6f}".format(p) for p in src_probs.tolist()] for src_probs in attn_valid
+            ["{:.6f}".format(p) for p in src_probs.tolist()]
+            for src_probs in attn_valid
         ]
     return alignment
 
@@ -727,28 +712,6 @@ def tpu_data_loader(itr):
         start=getattr(itr, "n", 0),
         total=len(itr),
     )
-
-
-def is_xla_tensor(tensor):
-    return torch.is_tensor(tensor) and tensor.device.type == "xla"
-
-
-def index_put(tensor, indices, value):
-    if is_xla_tensor(tensor):
-        for _ in range(indices.dim(), tensor.dim()):
-            indices = indices.unsqueeze(-1)
-        if indices.size(-1) < tensor.size(-1):
-            indices = indices.expand_as(tensor)
-        tensor = torch.mul(tensor, ~indices) + torch.mul(value, indices)
-    else:
-        tensor[indices] = value
-    return tensor
-
-
-def xla_device_to_cpu(dat):
-    import torch_xla.core.xla_model as xm
-
-    return xm._maybe_convert_to_cpu(dat)
 
 
 class CudaEnvironment(object):
@@ -812,19 +775,24 @@ def eval_bool(x, default=False):
         return default
 
 
-def reset_logging():
-    root = logging.getLogger()
-    for handler in root.handlers:
-        root.removeHandler(handler)
-    root.setLevel(os.environ.get("LOGLEVEL", "INFO").upper())
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    root.addHandler(handler)
+def print_r0(x, file=None):
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(x, file=file, flush=True)
+
+
+def round_safe(x):
+    if torch.is_tensor(x):
+        return float(np.round(x.cpu().numpy(), 4))
+    else:
+        try:
+            return round(x, 4)
+        except Exception:
+            return x
+
+def print_mem(msg):
+    gb_denom = 1024**3
+    mem_info = f'max_GB: {torch.cuda.max_memory_allocated()/gb_denom:.1f}, current_GB: {torch.cuda.memory_allocated()/gb_denom:.1f}'
+    print_r0(f'{msg}: {mem_info}')
 
 
 def safe_getattr(obj, k, default=None):
@@ -840,3 +808,19 @@ def safe_getattr(obj, k, default=None):
 def safe_hasattr(obj, k):
     """Returns True if the given key exists and is not None."""
     return getattr(obj, k, None) is not None
+
+
+def is_xla_tensor(tensor):
+    return torch.is_tensor(tensor) and tensor.device.type == "xla"
+
+
+def index_put(tensor, indices, value):
+    if is_xla_tensor(tensor):
+        for _ in range(indices.dim(), tensor.dim()):
+            indices = indices.unsqueeze(-1)
+        if indices.size(-1) < tensor.size(-1):
+            indices = indices.expand_as(tensor)
+        tensor = torch.mul(tensor, ~indices) + torch.mul(value, indices)
+    else:
+        tensor[indices] = value
+    return tensor

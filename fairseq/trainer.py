@@ -382,6 +382,7 @@ class Trainer(object):
             ) = moe_checkpoint_utils.split_shared_and_expert_states(
                 self.model,
                 self.optimizer,
+                no_save_optimizer_state=self.cfg.checkpoint.no_save_optimizer_state,
             )
             model_save_list = [(
                 filename,

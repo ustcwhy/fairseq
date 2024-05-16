@@ -49,7 +49,7 @@ def merge_expert_and_shared_state(expert_state, shared_state):
     return state
 
 
-def split_shared_and_expert_states(model, optimizer):
+def split_shared_and_expert_states(model, optimizer, no_save_optimizer_state=False):
     model_state_dict = model.state_dict()
     shared_model_state_dict = OrderedDict()
     expert_model_state_dict = OrderedDict()
@@ -60,13 +60,14 @@ def split_shared_and_expert_states(model, optimizer):
         else:
             shared_model_state_dict[name] = value
 
-    shared_optimizer_state_dict = {}
-    expert_optimizer_state_dict = {}
-    optimizer_state_dict = optimizer.state_dict()
-    for key in ['param_groups', 'loss_scale']:
-        if key in optimizer_state_dict:
-            expert_optimizer_state_dict[key] = optimizer_state_dict[key]
-            shared_optimizer_state_dict[key] = optimizer_state_dict[key]
+    if not no_save_optimizer_state:
+        shared_optimizer_state_dict = {}
+        expert_optimizer_state_dict = {}
+        optimizer_state_dict = optimizer.state_dict()
+        for key in ['param_groups', 'loss_scale']:
+            if key in optimizer_state_dict:
+                expert_optimizer_state_dict[key] = optimizer_state_dict[key]
+                shared_optimizer_state_dict[key] = optimizer_state_dict[key]
 
     param_mappings = {}
     param_id_to_is_expert = {}
@@ -83,18 +84,24 @@ def split_shared_and_expert_states(model, optimizer):
         # return packed
 
     # param_groups = [pack_group(g) ]
-    expert_optimizer_state_dict['state'] = {
-        k: v for k, v in optimizer_state_dict['state'].items()
-        if param_id_to_is_expert[k]
-    }
-    shared_optimizer_state_dict['state'] = {
-        k: v for k, v in optimizer_state_dict['state'].items()
-        if not param_id_to_is_expert[k]
-    }
-    return (
-        (shared_model_state_dict, shared_optimizer_state_dict),
-        (expert_model_state_dict, expert_optimizer_state_dict),
-    )
+    if not no_save_optimizer_state:
+        expert_optimizer_state_dict['state'] = {
+            k: v for k, v in optimizer_state_dict['state'].items()
+            if param_id_to_is_expert[k]
+        }
+        shared_optimizer_state_dict['state'] = {
+            k: v for k, v in optimizer_state_dict['state'].items()
+            if not param_id_to_is_expert[k]
+        }
+        return (
+            (shared_model_state_dict, shared_optimizer_state_dict),
+            (expert_model_state_dict, expert_optimizer_state_dict),
+        )
+    else:
+        return (
+            (shared_model_state_dict, None),
+            (expert_model_state_dict, None),
+        )
 
 
 def merge_multi_local_expert_states(expert_states: List[Dict]) -> Dict:

@@ -36,6 +36,9 @@ class FairseqAdamConfig(FairseqDataclass):
     fp16_adam_stats: bool = field(
         default=False, metadata={"help": "use FP16 stats (with automatic scaling)"}
     )
+    use_fused_adam_v2: bool = field(
+        default=False, metadata={"help": ""}
+    )
     # TODO common vars below in parent
     tpu: bool = II("common.tpu")
     bf16: bool = II("common.bf16")
@@ -56,7 +59,7 @@ class FairseqAdam(FairseqOptimizer):
         super().__init__(cfg)
         # fused_adam_cls = get_fused_adam_class()
         adam_v2 = False
-        if getattr(cfg, "bf16", False):
+        if getattr(cfg, "bf16", False) or getattr(cfg, "use_fused_adam_v2", False):
             adam_v2 = True
         fused_adam_cls = get_fused_adam_class(adam_v2)
         use_fused_adam = (

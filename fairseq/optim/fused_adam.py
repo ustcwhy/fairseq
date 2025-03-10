@@ -114,6 +114,7 @@ class FusedAdamV1(torch.optim.Optimizer):
         self.use_fp16_stats = use_fp16_stats
         self.FLOAT16_MAX = 65504.0
         self.fp16_lr_coef = fp16_lr_coef
+        assert self.fp16_lr_coef > 0
 
     @property
     def supports_memory_efficient_fp16(self):
@@ -286,6 +287,7 @@ try:
                     "Apex installation is outdated. Please install an updated version of apex."
                 )
             self.fp16_lr_coef = fp16_lr_coef
+            assert self.fp16_lr_coef > 0
 
         @property
         def supports_memory_efficient_fp16(self):

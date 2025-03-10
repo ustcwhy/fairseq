@@ -186,6 +186,7 @@ class Adam(torch.optim.Optimizer):
         )
         super(Adam, self).__init__(params, defaults)
         self.fp16_lr_coef = fp16_lr_coef
+        assert self.fp16_lr_coef > 0
 
     @property
     def supports_memory_efficient_fp16(self):

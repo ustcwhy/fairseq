@@ -41,6 +41,7 @@ class FairseqAdamConfig(FairseqDataclass):
     bf16: bool = II("common.bf16")
     lr: List[float] = II("optimization.lr")
     block_wise: bool = field(default=False, metadata={"help": "Enables block-wise optimization for 8-bit Adam"})
+    fp16_lr_coef: float = field(default=-1.0, metadata={"help": ""})
 
 
 @register_optimizer("adam", dataclass=FairseqAdamConfig)
@@ -97,6 +98,7 @@ class FairseqAdam(FairseqOptimizer):
             "betas": eval(self.cfg.adam_betas),
             "eps": self.cfg.adam_eps,
             "weight_decay": self.cfg.weight_decay,
+            "fp16_lr_coef": self.cfg.fp16_lr_coef,
         }
 
     def average_params(self):
@@ -177,11 +179,13 @@ class Adam(torch.optim.Optimizer):
         eps=1e-8,
         weight_decay=0,
         amsgrad=False,
+        fp16_lr_coef=-1.0,
     ):
         defaults = dict(
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad
         )
         super(Adam, self).__init__(params, defaults)
+        self.fp16_lr_coef = fp16_lr_coef
 
     @property
     def supports_memory_efficient_fp16(self):
@@ -257,9 +261,13 @@ class Adam(torch.optim.Optimizer):
                 else:
                     denom = exp_avg_sq.sqrt().add_(group["eps"])
 
+                if self.fp16_lr_coef > 0:
+                    lr = group["lr"] * self.fp16_lr_coef if p.param_group == "fp16" else group["lr"]
+                else:
+                    lr = group["lr"]
                 bias_correction1 = 1 - beta1 ** state["step"]
                 bias_correction2 = 1 - beta2 ** state["step"]
-                step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1
+                step_size = lr * math.sqrt(bias_correction2) / bias_correction1
 
                 if group["weight_decay"] != 0:
                     p_data_fp32.add_(

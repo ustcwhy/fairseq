@@ -91,6 +91,7 @@ class FusedAdamV1(torch.optim.Optimizer):
         max_grad_norm=0.0,
         amsgrad=False,
         use_fp16_stats=False,
+        fp16_lr_coef=-1,
     ):
         global fused_adam_cuda
         import importlib
@@ -112,6 +113,7 @@ class FusedAdamV1(torch.optim.Optimizer):
 
         self.use_fp16_stats = use_fp16_stats
         self.FLOAT16_MAX = 65504.0
+        self.fp16_lr_coef = fp16_lr_coef
 
     @property
     def supports_memory_efficient_fp16(self):
@@ -222,6 +224,11 @@ class FusedAdamV1(torch.optim.Optimizer):
 
                 state["step"] += 1
 
+                if self.fp16_lr_coef > 0:
+                    lr = group["lr"] * self.fp16_lr_coef if p.param_group == "fp16" else group["lr"]
+                else:
+                    lr = group["lr"]
+
                 with torch.cuda.device(p_data_fp32.device):
                     fused_adam_cuda.adam(
                         p_data_fp32,
@@ -229,7 +236,7 @@ class FusedAdamV1(torch.optim.Optimizer):
                         exp_avg,
                         exp_avg_sq,
                         grad,
-                        group["lr"],
+                        lr,
                         beta1,
                         beta2,
                         group["eps"],
@@ -270,7 +277,7 @@ try:
         and params to FP32 internally to support ``--memory-efficient-fp16``.
         """
 
-        def __init__(self, *args, use_fp16_stats=False, **kwargs):
+        def __init__(self, *args, use_fp16_stats=False, fp16_lr_coef=-1, **kwargs):
             if use_fp16_stats:
                 raise NotImplementedError("--fp16-adam-stats is only supported with FusedAdamV1")
             super().__init__(*args, **kwargs)
@@ -278,6 +285,7 @@ try:
                 raise Exception(
                     "Apex installation is outdated. Please install an updated version of apex."
                 )
+            self.fp16_lr_coef = fp16_lr_coef
 
         @property
         def supports_memory_efficient_fp16(self):
@@ -311,12 +319,16 @@ try:
                 else:
                     group["step"] = 1
 
+                # handle bitnet param
                 # create lists for multi-tensor apply
                 g_16, p_16, orig_p_16, m_16, v_16 = [], [], [], [], []
                 g_32, p_32, m_32, v_32 = [], [], [], []
 
                 for p in group["params"]:
                     if p.grad is None:
+                        continue
+                    if hasattr(p, "param_group") and p.param_group == "fp16":
+                        # jump all fp16 param
                         continue
                     if p.grad.data.is_sparse:
                         raise RuntimeError(
@@ -378,6 +390,87 @@ try:
                             self._dummy_overflow_buf,
                             [g_32, p_32, m_32, v_32],
                             group["lr"],
+                            beta1,
+                            beta2,
+                            group["eps"],
+                            group["step"],
+                            self.adam_w_mode,
+                            bias_correction,
+                            group["weight_decay"],
+                        )
+
+
+                # handle fp16 param
+                # create lists for multi-tensor apply
+                g_16, p_16, orig_p_16, m_16, v_16 = [], [], [], [], []
+                g_32, p_32, m_32, v_32 = [], [], [], []
+
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    if hasattr(p, "param_group") and p.param_group == "bitnet":
+                        # jump all bitnet param
+                        continue
+                    if p.grad.data.is_sparse:
+                        raise RuntimeError(
+                            "FusedAdam does not support sparse gradients, "
+                            "please consider SparseAdam instead"
+                        )
+
+                    state = self.state[p]
+                    # State initialization
+                    if len(state) == 0:
+                        # Exponential moving average of gradient values
+                        state["exp_avg"] = torch.zeros_like(p.data, dtype=torch.float)
+                        # Exponential moving average of squared gradient values
+                        state["exp_avg_sq"] = torch.zeros_like(
+                            p.data, dtype=torch.float
+                        )
+                    else:
+                        state["exp_avg"] = state["exp_avg"].to(
+                            device=p.data.device, dtype=torch.float
+                        )
+                        state["exp_avg_sq"] = state["exp_avg_sq"].to(
+                            device=p.data.device, dtype=torch.float
+                        )
+
+                    if p.dtype == torch.float16:
+                        g_16.append(p.grad.data.float())
+                        p_16.append(p.data.float())
+                        orig_p_16.append(p.data)
+                        m_16.append(state["exp_avg"])
+                        v_16.append(state["exp_avg_sq"])
+                    elif p.dtype == torch.float32:
+                        g_32.append(p.grad.data)
+                        p_32.append(p.data)
+                        m_32.append(state["exp_avg"])
+                        v_32.append(state["exp_avg_sq"])
+                    else:
+                        raise RuntimeError("FusedAdam only support fp16 and fp32.")
+
+                with torch.cuda.device(p.device):
+                    if len(g_16) > 0:
+                        multi_tensor_applier(
+                            self.multi_tensor_adam,
+                            self._dummy_overflow_buf,
+                            [g_16, p_16, m_16, v_16],
+                            group["lr"] * self.fp16_lr_coef, # use fp16 lr
+                            beta1,
+                            beta2,
+                            group["eps"],
+                            group["step"],
+                            self.adam_w_mode,
+                            bias_correction,
+                            group["weight_decay"],
+                        )
+                        for orig_p, p in zip(orig_p_16, p_16):
+                            orig_p.copy_(p.data)
+                    if len(g_32) > 0:
+                        multi_tensor_applier(
+                            self.multi_tensor_adam,
+                            self._dummy_overflow_buf,
+                            [g_32, p_32, m_32, v_32],
+                            group["lr"] * self.fp16_lr_coef, # use fp16 lr
                             beta1,
                             beta2,
                             group["eps"],
